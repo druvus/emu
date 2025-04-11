@@ -87,6 +87,12 @@ def create_parser() -> argparse.ArgumentParser:
         help='minibatch size for minimap2 mapping'
     )
     abundance_parser.add_argument(
+        '--batch-size',
+        type=int,
+        default=1000,
+        help='batch size for processing large datasets in EM algorithm'
+    )
+    abundance_parser.add_argument(
         '--mm2-forward-only',
         action="store_true",
         help='force minimap2 to consider the forward transcript strand only'
@@ -324,7 +330,8 @@ def run_abundance(config: EmuConfig) -> None:
         log_prob_rgs,
         db_species_tids,
         0.01,
-        config.min_abundance
+        config.min_abundance,
+        batch_size=config.batch_size
     )
 
     # Calculate classified and unclassified reads

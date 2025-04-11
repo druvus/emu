@@ -44,6 +44,7 @@ class EmuConfig:
             self.min_abundance = getattr(args, 'min_abundance', 0.0001)
             self.N = getattr(args, 'N', 50)
             self.K = getattr(args, 'K', 500000000)
+            self.batch_size = getattr(args, 'batch_size', 1000)
             self.mm2_forward_only = getattr(args, 'mm2_forward_only', False)
             self.output_dir = Path(getattr(args, 'output_dir', "./results"))
             self.output_basename = getattr(args, 'output_basename', None)
