@@ -15,11 +15,42 @@ from flatten_dict import unflatten
 from Bio import SeqIO
 from scipy import sparse
 
+# Add numba imports
+try:
+    from numba import jit, njit, prange, float32, int32, float64, int64
+    NUMBA_AVAILABLE = True
+except ImportError:
+    # Define dummy decorator if numba not available
+    def jit(*args, **kwargs):
+        if callable(args[0]):
+            return args[0]
+        else:
+            def decorator(func):
+                return func
+            return decorator
+    njit = jit
+    def prange(*args):
+        return range(*args)
+    NUMBA_AVAILABLE = False
+
 from emu.models.errors import AlignmentError, CalculationError
 from emu.core.utils import (
     get_align_stats, get_align_len, CIGAR_OPS, CIGAR_OPS_ALL,
-    TAXONOMY_RANKS, RANKS_PRINTOUT
+    TAXONOMY_RANKS, RANKS_PRINTOUT,
+    # Import new JIT-optimized functions if available:
+    sum_cigar_ops, get_align_len_numba, get_align_stats_numba
 )
+# Import JIT helper functions if module exists
+try:
+    from emu.core.jit_helpers import (
+        batch_process_alignments, process_p_matrix
+    )
+except ImportError:
+    # Define empty stubs if module doesn't exist
+    def batch_process_alignments(*args, **kwargs):
+        return []
+    def process_p_matrix(*args, **kwargs):
+        return np.array([])
 
 logger = logging.getLogger(__name__)
 
@@ -37,25 +68,22 @@ def get_cigar_op_log_probabilities(
         alignment_count = 0
         primary_alignment_count = 0
 
-        # Process alignments
+        # Process alignments in batches for efficiency
+        BATCH_SIZE = 10000
+        alignments = []
+
         for alignment in sam_pysam.fetch():
+            alignments.append(alignment)
             alignment_count += 1
-            align_len = get_align_len(alignment)
 
-            # Track longest alignment per read using vectorized max
-            query_name = alignment.query_name
-            dict_longest_align[query_name] = max(
-                dict_longest_align.get(query_name, 0),
-                align_len
-            )
+            # Process in batches
+            if len(alignments) >= BATCH_SIZE:
+                process_alignments_batch(alignments, cigar_stats_primary, dict_longest_align, primary_alignment_count)
+                alignments = []
 
-            # Process primary alignments only
-            if (not alignment.is_secondary and
-                not alignment.is_supplementary and
-                alignment.reference_name):
-                primary_alignment_count += 1
-                current_stats = np.array(get_align_stats(alignment), dtype=np.int32)
-                cigar_stats_primary += current_stats
+        # Process remaining alignments
+        if alignments:
+            process_alignments_batch(alignments, cigar_stats_primary, dict_longest_align, primary_alignment_count)
 
         logger.debug(f"Total alignments: {alignment_count}, Primary alignments: {primary_alignment_count}")
 
@@ -82,6 +110,49 @@ def get_cigar_op_log_probabilities(
 
     except Exception as e:
         raise AlignmentError(f"Error calculating CIGAR operation probabilities: {str(e)}")
+
+def process_alignments_batch(alignments, cigar_stats_primary, dict_longest_align, primary_alignment_count):
+    """Process a batch of alignments for CIGAR stats calculation."""
+    for alignment in alignments:
+        align_len = get_align_len(alignment)
+
+        # Track longest alignment per read using vectorized max
+        query_name = alignment.query_name
+        dict_longest_align[query_name] = max(
+            dict_longest_align.get(query_name, 0),
+            align_len
+        )
+
+        # Process primary alignments only
+        if (not alignment.is_secondary and
+            not alignment.is_supplementary and
+            alignment.reference_name):
+            primary_alignment_count += 1
+            current_stats = np.array(get_align_stats(alignment), dtype=np.int32)
+            cigar_stats_primary += current_stats
+
+    return primary_alignment_count
+
+# JIT-compiled version of log probability calculation
+@njit
+def compute_log_prob_rgs_numba(cigar_stats, log_p_cigar_op, longest_align, align_len):
+    """
+    JIT-compiled version of the log probability computation.
+
+    Args:
+        cigar_stats: Array of cigar stats to compute
+        log_p_cigar_op: Array of cigar_op probabilities
+        longest_align: Maximum alignment length for the query
+        align_len: Number of columns in the alignment
+
+    Returns:
+        Log score for the alignment
+    """
+    log_score = 0.0
+    for i in range(len(cigar_stats)):
+        log_score += log_p_cigar_op[i] * cigar_stats[i]
+
+    return log_score * (longest_align/align_len)
 
 def compute_log_prob_rgs(
     alignment: pysam.AlignedSegment,
@@ -115,11 +186,20 @@ def compute_log_prob_rgs(
         if align_len == 0:
             raise AlignmentError(f"Alignment length is zero for {query_name}")
 
-        # Vectorized computation of log score
-        cigar_stats_np = np.array(cigar_stats)
-        log_p_cigar_op_np = np.array(log_p_cigar_op)
-        log_score = np.sum(log_p_cigar_op_np * cigar_stats_np) * \
-                    (dict_longest_align[query_name]/align_len)
+        # Use JIT version if available
+        if NUMBA_AVAILABLE:
+            cigar_stats_np = np.array(cigar_stats, dtype=np.int32)
+            log_p_cigar_op_np = np.array(log_p_cigar_op, dtype=np.float64)
+            log_score = compute_log_prob_rgs_numba(
+                cigar_stats_np,
+                log_p_cigar_op_np,
+                dict_longest_align[query_name],
+                align_len
+            )
+        else:
+            # Fallback to non-JIT version
+            log_score = sum(c * p for c, p in zip(cigar_stats, log_p_cigar_op)) * \
+                        (dict_longest_align[query_name]/align_len)
 
         species_tid = int(ref_name.split(":")[0])
 
@@ -154,7 +234,7 @@ def log_prob_rgs_dict(
     """
     try:
         # Convert to numpy arrays for vectorized operations
-        log_p_cigar_op_np = np.array(log_p_cigar_op)
+        log_p_cigar_op_np = np.array(log_p_cigar_op, dtype=np.float64)
 
         # Calculate log(L(read|seq)) for all alignments
         log_p_rgs = {}
@@ -163,64 +243,32 @@ def log_prob_rgs_dict(
         # Open SAM file
         sam_filename = pysam.AlignmentFile(str(sam_path), 'rb')
 
-        # Process based on whether there are zero probability locations
-        if not p_cigar_op_zero_locs:
-            for alignment in sam_filename.fetch():
-                align_len = get_align_len(alignment)
-                if alignment.reference_name and align_len:
-                    cigar_stats = get_align_stats(alignment)
-                    log_score, query_name, species_tid = compute_log_prob_rgs(
-                        alignment, cigar_stats, log_p_cigar_op,
-                        dict_longest_align, align_len
-                    )
+        # Process in batches for better efficiency
+        BATCH_SIZE = 5000
+        alignments = []
+        processed_count = 0
 
-                    if query_name not in log_p_rgs:
-                        log_p_rgs[query_name] = ([species_tid], [log_score])
-                    elif query_name in log_p_rgs:
-                        if species_tid not in log_p_rgs[query_name][0]:
-                            log_p_rgs[query_name] = (
-                                log_p_rgs[query_name][0] + [species_tid],
-                                log_p_rgs[query_name][1] + [log_score]
-                            )
-                        else:
-                            logprgs_idx = log_p_rgs[query_name][0].index(species_tid)
-                            if log_p_rgs[query_name][1][logprgs_idx] < log_score:
-                                log_p_rgs[query_name][1][logprgs_idx] = log_score
+        for alignment in sam_filename.fetch():
+            alignments.append(alignment)
+            processed_count += 1
 
-                else:
-                    unmapped_set.add(alignment.query_name)
-        else:
-            # Convert zero locations to numpy array for vectorized filtering
-            p_cigar_op_zero_locs_np = np.array(p_cigar_op_zero_locs)
+            if len(alignments) >= BATCH_SIZE:
+                process_log_prob_batch(
+                    alignments, log_p_rgs, unmapped_set,
+                    log_p_cigar_op_np, dict_longest_align, p_cigar_op_zero_locs
+                )
+                alignments = []
 
-            for alignment in sam_filename.fetch():
-                align_len = get_align_len(alignment)
-                if alignment.reference_name and align_len:
-                    cigar_stats = np.array(get_align_stats(alignment))
+                # Log progress for very large files
+                if processed_count % 100000 == 0:
+                    logger.info(f"Processed {processed_count} alignments")
 
-                    # Vectorized check for zero operations
-                    if np.sum(cigar_stats[p_cigar_op_zero_locs_np]) == 0:
-                        # Vectorized deletion of zero locations
-                        filtered_cigar_stats = np.delete(cigar_stats, p_cigar_op_zero_locs_np)
-
-                        log_score, query_name, species_tid = compute_log_prob_rgs(
-                            alignment, filtered_cigar_stats.tolist(), log_p_cigar_op,
-                            dict_longest_align, align_len
-                        )
-
-                        if query_name not in log_p_rgs:
-                            log_p_rgs[query_name] = ([species_tid], [log_score])
-                        elif query_name in log_p_rgs and species_tid not in log_p_rgs[query_name][0]:
-                            log_p_rgs[query_name] = (
-                                log_p_rgs[query_name][0] + [species_tid],
-                                log_p_rgs[query_name][1] + [log_score]
-                            )
-                        else:
-                            logprgs_idx = log_p_rgs[query_name][0].index(species_tid)
-                            if log_p_rgs[query_name][1][logprgs_idx] < log_score:
-                                log_p_rgs[query_name][1][logprgs_idx] = log_score
-                else:
-                    unmapped_set.add(alignment.query_name)
+        # Process remaining alignments
+        if alignments:
+            process_log_prob_batch(
+                alignments, log_p_rgs, unmapped_set,
+                log_p_cigar_op_np, dict_longest_align, p_cigar_op_zero_locs
+            )
 
         # Calculate mapped and unmapped sets
         mapped_set = set(log_p_rgs.keys())
@@ -234,6 +282,141 @@ def log_prob_rgs_dict(
     except Exception as e:
         raise AlignmentError(f"Error building log probability dictionary: {str(e)}")
 
+def process_log_prob_batch(
+    alignments, log_p_rgs, unmapped_set,
+    log_p_cigar_op_np, dict_longest_align, p_cigar_op_zero_locs
+):
+    """Process a batch of alignments for log probability calculation."""
+    # Process based on whether there are zero probability locations
+    if not p_cigar_op_zero_locs:
+        for alignment in alignments:
+            align_len = get_align_len(alignment)
+            if alignment.reference_name and align_len:
+                cigar_stats = get_align_stats(alignment)
+                log_score, query_name, species_tid = compute_log_prob_rgs(
+                    alignment, cigar_stats, log_p_cigar_op_np,
+                    dict_longest_align, align_len
+                )
+
+                if query_name not in log_p_rgs:
+                    log_p_rgs[query_name] = ([species_tid], [log_score])
+                elif query_name in log_p_rgs:
+                    if species_tid not in log_p_rgs[query_name][0]:
+                        log_p_rgs[query_name] = (
+                            log_p_rgs[query_name][0] + [species_tid],
+                            log_p_rgs[query_name][1] + [log_score]
+                        )
+                    else:
+                        logprgs_idx = log_p_rgs[query_name][0].index(species_tid)
+                        if log_p_rgs[query_name][1][logprgs_idx] < log_score:
+                            log_p_rgs[query_name][1][logprgs_idx] = log_score
+
+            else:
+                unmapped_set.add(alignment.query_name)
+    else:
+        # Convert zero locations to numpy array for vectorized filtering
+        p_cigar_op_zero_locs_np = np.array(p_cigar_op_zero_locs, dtype=np.int32)
+
+        for alignment in alignments:
+            align_len = get_align_len(alignment)
+            if alignment.reference_name and align_len:
+                cigar_stats = np.array(get_align_stats(alignment), dtype=np.int32)
+
+                # Vectorized check for zero operations
+                if np.sum(cigar_stats[p_cigar_op_zero_locs_np]) == 0:
+                    # Vectorized deletion of zero locations
+                    filtered_cigar_stats = np.delete(cigar_stats, p_cigar_op_zero_locs_np)
+
+                    log_score, query_name, species_tid = compute_log_prob_rgs(
+                        alignment, filtered_cigar_stats.tolist(), log_p_cigar_op_np,
+                        dict_longest_align, align_len
+                    )
+
+                    if query_name not in log_p_rgs:
+                        log_p_rgs[query_name] = ([species_tid], [log_score])
+                    elif query_name in log_p_rgs and species_tid not in log_p_rgs[query_name][0]:
+                        log_p_rgs[query_name] = (
+                            log_p_rgs[query_name][0] + [species_tid],
+                            log_p_rgs[query_name][1] + [log_score]
+                        )
+                    else:
+                        logprgs_idx = log_p_rgs[query_name][0].index(species_tid)
+                        if log_p_rgs[query_name][1][logprgs_idx] < log_score:
+                            log_p_rgs[query_name][1][logprgs_idx] = log_score
+            else:
+                unmapped_set.add(alignment.query_name)
+
+# EM Algorithm Optimizations
+
+# Helper functions for EM algorithm with JIT
+@njit
+def compute_log_joint(log_prob_data, log_prob_indices, log_prob_indptr, log_freq_vector, n_reads):
+    """JIT-optimized computation of log joint probabilities."""
+    log_joint_data = np.copy(log_prob_data)
+
+    # Add log frequencies to each column
+    for i in range(len(log_prob_indptr) - 1):
+        start, end = log_prob_indptr[i], log_prob_indptr[i+1]
+        for j in range(start, end):
+            col = log_prob_indices[j]
+            log_joint_data[j] += log_freq_vector[col]
+
+    return log_joint_data
+
+@njit
+def compute_row_max(data, indices, indptr, n_rows):
+    """JIT-optimized computation of row maximums for sparse matrix."""
+    row_max = np.full(n_rows, -np.inf)
+
+    for i in range(len(indptr) - 1):
+        start, end = indptr[i], indptr[i+1]
+        if start < end:  # If row has entries
+            row_max_val = -np.inf
+            for j in range(start, end):
+                row_max_val = max(row_max_val, data[j])
+            row_max[i] = row_max_val
+
+    return row_max
+
+@njit
+def compute_exp_and_sum(data, indices, indptr, row_max, n_rows):
+    """JIT-optimized exponential and normalization for sparse matrix."""
+    exp_data = np.zeros_like(data)
+    row_sums = np.zeros(n_rows)
+
+    for i in range(len(indptr) - 1):
+        start, end = indptr[i], indptr[i+1]
+        row_sum = 0.0
+
+        for j in range(start, end):
+            exp_val = np.exp(data[j] - row_max[i])
+            exp_data[j] = exp_val
+            row_sum += exp_val
+
+        row_sums[i] = row_sum
+
+    return exp_data, row_sums
+
+@njit
+def compute_posterior_and_freqs(exp_data, indices, indptr, row_sums, n_rows, n_taxa):
+    """JIT-optimized posterior probability and frequency computation."""
+    posterior_data = np.zeros_like(exp_data)
+    new_freq_vector = np.zeros(n_taxa)
+
+    for i in range(len(indptr) - 1):
+        start, end = indptr[i], indptr[i+1]
+        if start < end and row_sums[i] > 0:
+            for j in range(start, end):
+                posterior_data[j] = exp_data[j] / row_sums[i]
+                col = indices[j]
+                new_freq_vector[col] += posterior_data[j]
+
+    # Normalize new frequencies
+    total_reads = max(1, n_rows)
+    new_freq_vector /= total_reads
+
+    return posterior_data, new_freq_vector
+
 def expectation_maximization_vectorized(
     log_p_rgs: Dict[str, Tuple[List[int], List[float]]],
     freq: Dict[int, float],
@@ -241,7 +424,7 @@ def expectation_maximization_vectorized(
     epsilon: float = 1e-6
 ) -> Tuple[Dict[int, float], float, Dict[int, Dict[str, float]]]:
     """
-    Vectorized implementation of one iteration of the EM algorithm.
+    Vectorized implementation of one iteration of the EM algorithm with JIT optimization.
 
     Updates the relative abundance estimation in freq based on probabilities in log_p_rgs.
 
@@ -267,7 +450,7 @@ def expectation_maximization_vectorized(
         read_to_idx = {read: i for i, read in enumerate(all_reads)}
         taxon_to_idx = {taxon: i for i, taxon in enumerate(all_taxa)}
 
-        # Create sparse matrices
+        # Create sparse matrices - prepare data
         rows = []
         cols = []
         data = []
@@ -292,6 +475,8 @@ def expectation_maximization_vectorized(
         # Create the sparse log probability matrix
         n_reads = len(all_reads)
         n_taxa = len(all_taxa)
+
+        # Use CSR format for better performance with our operations
         log_prob_matrix = sparse.csr_matrix((data, (rows, cols)), shape=(n_reads, n_taxa))
 
         # Convert frequency vector to numpy array
@@ -306,69 +491,119 @@ def expectation_maximization_vectorized(
         log_freq_vector = np.log(np.maximum(freq_vector, 1e-15))  # Prevent log(0)
         log_likelihood_prev = -np.inf
 
+        # Get CSR matrix components for JIT functions
+        log_prob_data = log_prob_matrix.data
+        log_prob_indices = log_prob_matrix.indices
+        log_prob_indptr = log_prob_matrix.indptr
+
         # Perform EM iterations until convergence or max iterations
         for iteration in range(max_iterations):
-            # E-step: Calculate log probabilities
-            # Add log frequencies to log probabilities
-            log_joint = log_prob_matrix.copy()
-            log_joint_data = log_joint.data
+            # E-step: Calculate log probabilities using JIT functions if available
+            if NUMBA_AVAILABLE:
+                # Add log frequencies to log probabilities
+                log_joint_data = compute_log_joint(
+                    log_prob_data, log_prob_indices, log_prob_indptr,
+                    log_freq_vector, n_reads
+                )
 
-            # Add log frequencies to each column (taxon)
-            for i in range(log_joint.indptr.size - 1):
-                start, end = log_joint.indptr[i], log_joint.indptr[i+1]
-                for j in range(start, end):
-                    col = log_joint.indices[j]
-                    log_joint_data[j] += log_freq_vector[col]
+                # Create a view of the log joint matrix with updated data
+                log_joint = sparse.csr_matrix(
+                    (log_joint_data, log_prob_indices, log_prob_indptr),
+                    shape=(n_reads, n_taxa)
+                )
 
-            # Calculate log-sum-exp for each row (read)
-            row_max = np.zeros(n_reads)
-            for i in range(log_joint.indptr.size - 1):
-                if log_joint.indptr[i] < log_joint.indptr[i+1]:  # If row has any entries
+                # Calculate row maximums
+                row_max = compute_row_max(
+                    log_joint_data, log_prob_indices, log_prob_indptr, n_reads
+                )
+
+                # Calculate exp(log_joint - row_max) and row sums
+                exp_data, row_sums = compute_exp_and_sum(
+                    log_joint_data, log_prob_indices, log_prob_indptr,
+                    row_max, n_reads
+                )
+
+                # Calculate posteriors and new frequencies
+                posterior_data, new_freq_vector = compute_posterior_and_freqs(
+                    exp_data, log_prob_indices, log_prob_indptr,
+                    row_sums, n_reads, n_taxa
+                )
+
+                # Create posterior matrix from data
+                posterior = sparse.csr_matrix(
+                    (posterior_data, log_prob_indices, log_prob_indptr),
+                    shape=(n_reads, n_taxa)
+                )
+
+                # Calculate log-likelihood
+                log_likelihood = 0.0
+                for i in range(n_reads):
+                    if row_sums[i] > 0:
+                        log_likelihood += np.log(row_sums[i]) + row_max[i]
+
+            else:
+                # Original implementation for when Numba is not available
+                # E-step: Calculate log probabilities
+                # Add log frequencies to log probabilities
+                log_joint = log_prob_matrix.copy()
+                log_joint_data = log_joint.data
+
+                # Add log frequencies to each column (taxon)
+                for i in range(log_joint.indptr.size - 1):
                     start, end = log_joint.indptr[i], log_joint.indptr[i+1]
-                    row_max[i] = max(log_joint_data[j] for j in range(start, end))
-
-            # Calculate exp(log_joint - row_max) for each entry
-            exp_joint = log_joint.copy()
-            exp_joint_data = exp_joint.data
-            for i in range(exp_joint.indptr.size - 1):
-                if exp_joint.indptr[i] < exp_joint.indptr[i+1]:  # If row has any entries
-                    start, end = exp_joint.indptr[i], exp_joint.indptr[i+1]
                     for j in range(start, end):
-                        exp_joint_data[j] = np.exp(log_joint_data[j] - row_max[i])
+                        col = log_joint.indices[j]
+                        log_joint_data[j] += log_freq_vector[col]
 
-            # Calculate row sums (normalization)
-            row_sums = np.zeros(n_reads)
-            for i in range(exp_joint.indptr.size - 1):
-                if exp_joint.indptr[i] < exp_joint.indptr[i+1]:  # If row has any entries
-                    start, end = exp_joint.indptr[i], exp_joint.indptr[i+1]
-                    row_sums[i] = sum(exp_joint_data[j] for j in range(start, end))
+                # Calculate log-sum-exp for each row (read)
+                row_max = np.zeros(n_reads)
+                for i in range(log_joint.indptr.size - 1):
+                    if log_joint.indptr[i] < log_joint.indptr[i+1]:  # If row has any entries
+                        start, end = log_joint.indptr[i], log_joint.indptr[i+1]
+                        row_max[i] = max(log_joint_data[j] for j in range(start, end))
 
-            # Normalize to get posterior probabilities
-            posterior = exp_joint.copy()
-            posterior_data = posterior.data
-            for i in range(posterior.indptr.size - 1):
-                if posterior.indptr[i] < posterior.indptr[i+1] and row_sums[i] > 0:  # If row has any entries
-                    start, end = posterior.indptr[i], posterior.indptr[i+1]
-                    for j in range(start, end):
-                        posterior_data[j] /= row_sums[i]
+                # Calculate exp(log_joint - row_max) for each entry
+                exp_joint = log_joint.copy()
+                exp_joint_data = exp_joint.data
+                for i in range(exp_joint.indptr.size - 1):
+                    if exp_joint.indptr[i] < exp_joint.indptr[i+1]:  # If row has any entries
+                        start, end = exp_joint.indptr[i], exp_joint.indptr[i+1]
+                        for j in range(start, end):
+                            exp_joint_data[j] = np.exp(log_joint_data[j] - row_max[i])
 
-            # Calculate log-likelihood
-            log_likelihood = 0.0
-            for i in range(n_reads):
-                if row_sums[i] > 0:
-                    log_likelihood += np.log(row_sums[i]) + row_max[i]
+                # Calculate row sums (normalization)
+                row_sums = np.zeros(n_reads)
+                for i in range(exp_joint.indptr.size - 1):
+                    if exp_joint.indptr[i] < exp_joint.indptr[i+1]:  # If row has any entries
+                        start, end = exp_joint.indptr[i], exp_joint.indptr[i+1]
+                        row_sums[i] = sum(exp_joint_data[j] for j in range(start, end))
 
-            # M-step: Update frequencies
-            new_freq_vector = np.zeros(n_taxa)
-            for i in range(posterior.indptr.size - 1):
-                if posterior.indptr[i] < posterior.indptr[i+1]:  # If row has any entries
-                    start, end = posterior.indptr[i], posterior.indptr[i+1]
-                    for j in range(start, end):
-                        col = posterior.indices[j]
-                        new_freq_vector[col] += posterior_data[j]
+                # Normalize to get posterior probabilities
+                posterior = exp_joint.copy()
+                posterior_data = posterior.data
+                for i in range(posterior.indptr.size - 1):
+                    if posterior.indptr[i] < posterior.indptr[i+1] and row_sums[i] > 0:  # If row has any entries
+                        start, end = posterior.indptr[i], posterior.indptr[i+1]
+                        for j in range(start, end):
+                            posterior_data[j] /= row_sums[i]
 
-            # Normalize new frequencies
-            new_freq_vector /= max(1, n_reads)
+                # Calculate log-likelihood
+                log_likelihood = 0.0
+                for i in range(n_reads):
+                    if row_sums[i] > 0:
+                        log_likelihood += np.log(row_sums[i]) + row_max[i]
+
+                # M-step: Update frequencies
+                new_freq_vector = np.zeros(n_taxa)
+                for i in range(posterior.indptr.size - 1):
+                    if posterior.indptr[i] < posterior.indptr[i+1]:  # If row has any entries
+                        start, end = posterior.indptr[i], posterior.indptr[i+1]
+                        for j in range(start, end):
+                            col = posterior.indices[j]
+                            new_freq_vector[col] += posterior_data[j]
+
+                # Normalize new frequencies
+                new_freq_vector /= max(1, n_reads)
 
             # Check convergence
             rel_change = np.max(np.abs(new_freq_vector - freq_vector) / (freq_vector + epsilon))
@@ -401,7 +636,7 @@ def expectation_maximization_vectorized(
             for j in range(start, end):
                 col = posterior.indices[j]
                 taxon = all_taxa[col]
-                p_sgr_flat[(taxon, read)] = posterior_data[j]
+                p_sgr_flat[(taxon, read)] = posterior.data[j]
 
         # Convert flat dictionary to nested structure
         p_sgr = unflatten(p_sgr_flat)
