@@ -135,6 +135,40 @@ def create_parser() -> argparse.ArgumentParser:
         help='threads utilized by minimap'
     )
 
+    # New mapper options
+    abundance_parser.add_argument(
+        '--mapper',
+        type=str,
+        choices=['auto', 'minimap2', 'mm2-plus'],
+        default='auto',
+        help='mapping tool to use for alignments (auto tries mm2-plus first)'
+    )
+    abundance_parser.add_argument(
+        '--mm2plus-path',
+        type=str,
+        help='custom path to mm2-plus executable'
+    )
+
+    # Memory and performance options
+    abundance_parser.add_argument(
+        '--em-strategy',
+        type=str,
+        choices=['auto', 'vectorized', 'batch', 'memory_efficient'],
+        default='auto',
+        help='strategy for EM algorithm execution'
+    )
+    abundance_parser.add_argument(
+        '--memory-efficient',
+        action="store_true",
+        help='optimize for memory usage instead of speed'
+    )
+    abundance_parser.add_argument(
+        '--no-parallel',
+        dest='parallel',
+        action="store_false",
+        help='disable parallel processing'
+    )
+
     # Build-database command
     build_db_parser = subparsers.add_parser(
         "build-database",
@@ -275,11 +309,13 @@ def run_abundance(config: EmuConfig) -> None:
     """
     from emu.io.parsers import parse_taxonomy_file
     from emu.core.abundance import (
-        generate_alignments, get_cigar_op_log_probabilities,
-        log_prob_rgs_dict, expectation_maximization_iterations
+        log_prob_rgs_dict, expectation_maximization_iterations,
+        get_cigar_op_log_probabilities
     )
     from emu.io.writers import freq_to_lineage_df, output_read_assignments
     from emu.io.parsers import output_sequences
+    # Import the new mapping module
+    from emu.core.mapping import generate_alignments
 
     # Validate input files
     try:
@@ -305,7 +341,7 @@ def run_abundance(config: EmuConfig) -> None:
     else:
         out_basename = config.output_dir / config.output_basename
 
-    # Generate alignments and perform EM algorithm
+    # Generate alignments using the configured mapper
     sam_file = generate_alignments(
         config.input_files,
         out_basename,
@@ -314,11 +350,15 @@ def run_abundance(config: EmuConfig) -> None:
         config.threads,
         config.N,
         config.K,
-        config.mm2_forward_only
+        config.mm2_forward_only,
+        mapper_type=config.mapper_type,  # Pass the mapper type from config
+        mm2plus_path=config.mm2plus_path  # Pass the custom mm2plus path
     )
 
+    # Get CIGAR operation probabilities
     log_prob_cigar_op, locs_p_cigar_zero, longest_align_dict = get_cigar_op_log_probabilities(sam_file)
 
+    # Build log probability dictionary
     log_prob_rgs, set_unmapped, set_mapped = log_prob_rgs_dict(
         sam_file,
         log_prob_cigar_op,
@@ -326,12 +366,15 @@ def run_abundance(config: EmuConfig) -> None:
         locs_p_cigar_zero
     )
 
+    # Run EM algorithm with the configured strategy
     f_full, f_set_thresh, read_dist = expectation_maximization_iterations(
         log_prob_rgs,
         db_species_tids,
         0.01,
         config.min_abundance,
-        batch_size=config.batch_size
+        batch_size=config.batch_size,
+        em_strategy=config.em_strategy,  # Pass the EM strategy from config
+        parallel=config.parallel_processing  # Pass parallel processing flag
     )
 
     # Calculate classified and unclassified reads

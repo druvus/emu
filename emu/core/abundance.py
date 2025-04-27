@@ -15,42 +15,22 @@ from flatten_dict import unflatten
 from Bio import SeqIO
 from scipy import sparse
 
-# Add numba imports
-try:
-    from numba import jit, njit, prange, float32, int32, float64, int64
-    NUMBA_AVAILABLE = True
-except ImportError:
-    # Define dummy decorator if numba not available
-    def jit(*args, **kwargs):
-        if callable(args[0]):
-            return args[0]
-        else:
-            def decorator(func):
-                return func
-            return decorator
-    njit = jit
-    def prange(*args):
-        return range(*args)
-    NUMBA_AVAILABLE = False
-
 from emu.models.errors import AlignmentError, CalculationError
 from emu.core.utils import (
     get_align_stats, get_align_len, CIGAR_OPS, CIGAR_OPS_ALL,
-    TAXONOMY_RANKS, RANKS_PRINTOUT,
-    # Import new JIT-optimized functions if available:
-    sum_cigar_ops, get_align_len_numba, get_align_stats_numba
+    TAXONOMY_RANKS, RANKS_PRINTOUT
 )
-# Import JIT helper functions if module exists
-try:
-    from emu.core.jit_helpers import (
-        batch_process_alignments, process_p_matrix
-    )
-except ImportError:
-    # Define empty stubs if module doesn't exist
-    def batch_process_alignments(*args, **kwargs):
-        return []
-    def process_p_matrix(*args, **kwargs):
-        return np.array([])
+from emu.core.jit_utils import NUMBA_AVAILABLE, sum_array
+from emu.core.matrix_ops import (
+    compute_row_max, compute_exp_and_sum, compute_posterior_and_freqs,
+    parallel_compute_posterior, compute_log_joint
+)
+from emu.core.em_strategy import (
+    create_em_strategy, VectorizedEMStrategy, BatchEMStrategy, MemoryEfficientEMStrategy
+)
+from emu.core.batch_processing import (
+    BatchProcessor, AlignmentBatchProcessor, ReadBatchProcessor
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,27 +45,47 @@ def get_cigar_op_log_probabilities(
         # Open SAM file
         sam_pysam = pysam.AlignmentFile(str(sam_path))
 
-        alignment_count = 0
-        primary_alignment_count = 0
+        # Use batch processing for alignments
+        alignment_processor = AlignmentBatchProcessor(batch_size=10000, show_progress=True)
 
-        # Process alignments in batches for efficiency
-        BATCH_SIZE = 10000
-        alignments = []
+        # Create batched processing function
+        def process_batch(alignments):
+            batch_cigar_stats = np.zeros(len(CIGAR_OPS), dtype=np.int32)
+            batch_longest_align = {}
+            primary_count = 0
 
-        for alignment in sam_pysam.fetch():
-            alignments.append(alignment)
-            alignment_count += 1
+            for alignment in alignments:
+                align_len = get_align_len(alignment)
 
-            # Process in batches
-            if len(alignments) >= BATCH_SIZE:
-                process_alignments_batch(alignments, cigar_stats_primary, dict_longest_align, primary_alignment_count)
-                alignments = []
+                # Track longest alignment per read
+                query_name = alignment.query_name
+                batch_longest_align[query_name] = max(
+                    batch_longest_align.get(query_name, 0),
+                    align_len
+                )
 
-        # Process remaining alignments
-        if alignments:
-            process_alignments_batch(alignments, cigar_stats_primary, dict_longest_align, primary_alignment_count)
+                # Process primary alignments only
+                if (not alignment.is_secondary and
+                    not alignment.is_supplementary and
+                    alignment.reference_name):
+                    primary_count += 1
+                    current_stats = np.array(get_align_stats(alignment), dtype=np.int32)
+                    batch_cigar_stats += current_stats
 
-        logger.debug(f"Total alignments: {alignment_count}, Primary alignments: {primary_alignment_count}")
+            return batch_cigar_stats, batch_longest_align, primary_count
+
+        # Process all alignments in batches
+        total_alignments = 0
+        primary_alignments = 0
+
+        for batch in alignment_processor.process(sam_pysam.fetch(), lambda x: [x]):
+            batch_stats, batch_longest, batch_primary = process_batch(batch)
+            cigar_stats_primary += batch_stats
+            dict_longest_align.update(batch_longest)
+            primary_alignments += batch_primary
+            total_alignments += len(batch)
+
+        logger.debug(f"Total alignments: {total_alignments}, Primary alignments: {primary_alignments}")
 
         # Check if any probabilities are 0, if so, remove
         zero_locs = np.where(cigar_stats_primary == 0)[0].tolist()
@@ -110,49 +110,6 @@ def get_cigar_op_log_probabilities(
 
     except Exception as e:
         raise AlignmentError(f"Error calculating CIGAR operation probabilities: {str(e)}")
-
-def process_alignments_batch(alignments, cigar_stats_primary, dict_longest_align, primary_alignment_count):
-    """Process a batch of alignments for CIGAR stats calculation."""
-    for alignment in alignments:
-        align_len = get_align_len(alignment)
-
-        # Track longest alignment per read using vectorized max
-        query_name = alignment.query_name
-        dict_longest_align[query_name] = max(
-            dict_longest_align.get(query_name, 0),
-            align_len
-        )
-
-        # Process primary alignments only
-        if (not alignment.is_secondary and
-            not alignment.is_supplementary and
-            alignment.reference_name):
-            primary_alignment_count += 1
-            current_stats = np.array(get_align_stats(alignment), dtype=np.int32)
-            cigar_stats_primary += current_stats
-
-    return primary_alignment_count
-
-# JIT-compiled version of log probability calculation
-@njit
-def compute_log_prob_rgs_numba(cigar_stats, log_p_cigar_op, longest_align, align_len):
-    """
-    JIT-compiled version of the log probability computation.
-
-    Args:
-        cigar_stats: Array of cigar stats to compute
-        log_p_cigar_op: Array of cigar_op probabilities
-        longest_align: Maximum alignment length for the query
-        align_len: Number of columns in the alignment
-
-    Returns:
-        Log score for the alignment
-    """
-    log_score = 0.0
-    for i in range(len(cigar_stats)):
-        log_score += log_p_cigar_op[i] * cigar_stats[i]
-
-    return log_score * (longest_align/align_len)
 
 def compute_log_prob_rgs(
     alignment: pysam.AlignedSegment,
@@ -186,21 +143,19 @@ def compute_log_prob_rgs(
         if align_len == 0:
             raise AlignmentError(f"Alignment length is zero for {query_name}")
 
-        # Use JIT version if available
+        # Compute log score
         if NUMBA_AVAILABLE:
-            cigar_stats_np = np.array(cigar_stats, dtype=np.int32)
+            # Use JIT-optimized dot product
+            cigar_stats_np = np.array(cigar_stats, dtype=np.float64)
             log_p_cigar_op_np = np.array(log_p_cigar_op, dtype=np.float64)
-            log_score = compute_log_prob_rgs_numba(
-                cigar_stats_np,
-                log_p_cigar_op_np,
-                dict_longest_align[query_name],
-                align_len
-            )
+            log_score = np.dot(cigar_stats_np, log_p_cigar_op_np) * \
+                        (dict_longest_align[query_name]/align_len)
         else:
-            # Fallback to non-JIT version
+            # Fallback to standard dot product
             log_score = sum(c * p for c, p in zip(cigar_stats, log_p_cigar_op)) * \
                         (dict_longest_align[query_name]/align_len)
 
+        # Extract species taxonomy ID from reference name
         species_tid = int(ref_name.split(":")[0])
 
         return log_score, query_name, species_tid
@@ -236,39 +191,96 @@ def log_prob_rgs_dict(
         # Convert to numpy arrays for vectorized operations
         log_p_cigar_op_np = np.array(log_p_cigar_op, dtype=np.float64)
 
-        # Calculate log(L(read|seq)) for all alignments
+        # Initialize data structures
         log_p_rgs = {}
         unmapped_set = set()
 
         # Open SAM file
         sam_filename = pysam.AlignmentFile(str(sam_path), 'rb')
 
-        # Process in batches for better efficiency
-        BATCH_SIZE = 5000
-        alignments = []
+        # Use batch processing
+        alignment_processor = AlignmentBatchProcessor(batch_size=5000, show_progress=True)
+
+        # Create batch processing function
+        def process_log_prob_batch(batch_alignments):
+            batch_log_p_rgs = {}
+            batch_unmapped = set()
+
+            # Process zero locations case separately for efficiency
+            if not p_cigar_op_zero_locs:
+                for alignment in batch_alignments:
+                    align_len = get_align_len(alignment)
+                    if alignment.reference_name and align_len:
+                        cigar_stats = get_align_stats(alignment)
+                        log_score, query_name, species_tid = compute_log_prob_rgs(
+                            alignment, cigar_stats, log_p_cigar_op_np,
+                            dict_longest_align, align_len
+                        )
+
+                        if query_name not in batch_log_p_rgs:
+                            batch_log_p_rgs[query_name] = ([species_tid], [log_score])
+                        elif species_tid not in batch_log_p_rgs[query_name][0]:
+                            batch_log_p_rgs[query_name] = (
+                                batch_log_p_rgs[query_name][0] + [species_tid],
+                                batch_log_p_rgs[query_name][1] + [log_score]
+                            )
+                        else:
+                            logprgs_idx = batch_log_p_rgs[query_name][0].index(species_tid)
+                            if batch_log_p_rgs[query_name][1][logprgs_idx] < log_score:
+                                batch_log_p_rgs[query_name][1][logprgs_idx] = log_score
+                    else:
+                        batch_unmapped.add(alignment.query_name)
+
+            else:
+                # Use vectorized operations when handling zero locations
+                p_cigar_op_zero_locs_np = np.array(p_cigar_op_zero_locs, dtype=np.int32)
+
+                for alignment in batch_alignments:
+                    align_len = get_align_len(alignment)
+                    if alignment.reference_name and align_len:
+                        cigar_stats = np.array(get_align_stats(alignment), dtype=np.int32)
+
+                        # Vectorized check for zero operations
+                        if np.sum(cigar_stats[p_cigar_op_zero_locs_np]) == 0:
+                            # Vectorized deletion of zero locations
+                            filtered_cigar_stats = np.delete(cigar_stats, p_cigar_op_zero_locs_np)
+
+                            log_score, query_name, species_tid = compute_log_prob_rgs(
+                                alignment, filtered_cigar_stats.tolist(), log_p_cigar_op_np,
+                                dict_longest_align, align_len
+                            )
+
+                            if query_name not in batch_log_p_rgs:
+                                batch_log_p_rgs[query_name] = ([species_tid], [log_score])
+                            elif species_tid not in batch_log_p_rgs[query_name][0]:
+                                batch_log_p_rgs[query_name] = (
+                                    batch_log_p_rgs[query_name][0] + [species_tid],
+                                    batch_log_p_rgs[query_name][1] + [log_score]
+                                )
+                            else:
+                                logprgs_idx = batch_log_p_rgs[query_name][0].index(species_tid)
+                                if batch_log_p_rgs[query_name][1][logprgs_idx] < log_score:
+                                    batch_log_p_rgs[query_name][1][logprgs_idx] = log_score
+                    else:
+                        batch_unmapped.add(alignment.query_name)
+
+            return batch_log_p_rgs, batch_unmapped
+
+        # Process all alignments in batches
         processed_count = 0
 
-        for alignment in sam_filename.fetch():
-            alignments.append(alignment)
-            processed_count += 1
+        for batch in alignment_processor.process(sam_filename.fetch(), lambda x: [x]):
+            batch_log_p_rgs, batch_unmapped = process_log_prob_batch(batch)
 
-            if len(alignments) >= BATCH_SIZE:
-                process_log_prob_batch(
-                    alignments, log_p_rgs, unmapped_set,
-                    log_p_cigar_op_np, dict_longest_align, p_cigar_op_zero_locs
-                )
-                alignments = []
+            # Merge batch results into overall results
+            log_p_rgs.update(batch_log_p_rgs)
+            unmapped_set.update(batch_unmapped)
 
-                # Log progress for very large files
-                if processed_count % 100000 == 0:
-                    logger.info(f"Processed {processed_count} alignments")
+            processed_count += len(batch)
 
-        # Process remaining alignments
-        if alignments:
-            process_log_prob_batch(
-                alignments, log_p_rgs, unmapped_set,
-                log_p_cigar_op_np, dict_longest_align, p_cigar_op_zero_locs
-            )
+            # Log progress for very large files
+            if processed_count % 100000 == 0:
+                logger.info(f"Processed {processed_count} alignments")
 
         # Calculate mapped and unmapped sets
         mapped_set = set(log_p_rgs.keys())
@@ -282,449 +294,6 @@ def log_prob_rgs_dict(
     except Exception as e:
         raise AlignmentError(f"Error building log probability dictionary: {str(e)}")
 
-def process_log_prob_batch(
-    alignments, log_p_rgs, unmapped_set,
-    log_p_cigar_op_np, dict_longest_align, p_cigar_op_zero_locs
-):
-    """Process a batch of alignments for log probability calculation."""
-    # Process based on whether there are zero probability locations
-    if not p_cigar_op_zero_locs:
-        for alignment in alignments:
-            align_len = get_align_len(alignment)
-            if alignment.reference_name and align_len:
-                cigar_stats = get_align_stats(alignment)
-                log_score, query_name, species_tid = compute_log_prob_rgs(
-                    alignment, cigar_stats, log_p_cigar_op_np,
-                    dict_longest_align, align_len
-                )
-
-                if query_name not in log_p_rgs:
-                    log_p_rgs[query_name] = ([species_tid], [log_score])
-                elif query_name in log_p_rgs:
-                    if species_tid not in log_p_rgs[query_name][0]:
-                        log_p_rgs[query_name] = (
-                            log_p_rgs[query_name][0] + [species_tid],
-                            log_p_rgs[query_name][1] + [log_score]
-                        )
-                    else:
-                        logprgs_idx = log_p_rgs[query_name][0].index(species_tid)
-                        if log_p_rgs[query_name][1][logprgs_idx] < log_score:
-                            log_p_rgs[query_name][1][logprgs_idx] = log_score
-
-            else:
-                unmapped_set.add(alignment.query_name)
-    else:
-        # Convert zero locations to numpy array for vectorized filtering
-        p_cigar_op_zero_locs_np = np.array(p_cigar_op_zero_locs, dtype=np.int32)
-
-        for alignment in alignments:
-            align_len = get_align_len(alignment)
-            if alignment.reference_name and align_len:
-                cigar_stats = np.array(get_align_stats(alignment), dtype=np.int32)
-
-                # Vectorized check for zero operations
-                if np.sum(cigar_stats[p_cigar_op_zero_locs_np]) == 0:
-                    # Vectorized deletion of zero locations
-                    filtered_cigar_stats = np.delete(cigar_stats, p_cigar_op_zero_locs_np)
-
-                    log_score, query_name, species_tid = compute_log_prob_rgs(
-                        alignment, filtered_cigar_stats.tolist(), log_p_cigar_op_np,
-                        dict_longest_align, align_len
-                    )
-
-                    if query_name not in log_p_rgs:
-                        log_p_rgs[query_name] = ([species_tid], [log_score])
-                    elif query_name in log_p_rgs and species_tid not in log_p_rgs[query_name][0]:
-                        log_p_rgs[query_name] = (
-                            log_p_rgs[query_name][0] + [species_tid],
-                            log_p_rgs[query_name][1] + [log_score]
-                        )
-                    else:
-                        logprgs_idx = log_p_rgs[query_name][0].index(species_tid)
-                        if log_p_rgs[query_name][1][logprgs_idx] < log_score:
-                            log_p_rgs[query_name][1][logprgs_idx] = log_score
-            else:
-                unmapped_set.add(alignment.query_name)
-
-# EM Algorithm Optimizations
-
-# Helper functions for EM algorithm with JIT
-@njit
-def compute_log_joint(log_prob_data, log_prob_indices, log_prob_indptr, log_freq_vector, n_reads):
-    """JIT-optimized computation of log joint probabilities."""
-    log_joint_data = np.copy(log_prob_data)
-
-    # Add log frequencies to each column
-    for i in range(len(log_prob_indptr) - 1):
-        start, end = log_prob_indptr[i], log_prob_indptr[i+1]
-        for j in range(start, end):
-            col = log_prob_indices[j]
-            log_joint_data[j] += log_freq_vector[col]
-
-    return log_joint_data
-
-@njit
-def compute_row_max(data, indices, indptr, n_rows):
-    """JIT-optimized computation of row maximums for sparse matrix."""
-    row_max = np.full(n_rows, -np.inf)
-
-    for i in range(len(indptr) - 1):
-        start, end = indptr[i], indptr[i+1]
-        if start < end:  # If row has entries
-            row_max_val = -np.inf
-            for j in range(start, end):
-                row_max_val = max(row_max_val, data[j])
-            row_max[i] = row_max_val
-
-    return row_max
-
-@njit
-def compute_exp_and_sum(data, indices, indptr, row_max, n_rows):
-    """JIT-optimized exponential and normalization for sparse matrix."""
-    exp_data = np.zeros_like(data)
-    row_sums = np.zeros(n_rows)
-
-    for i in range(len(indptr) - 1):
-        start, end = indptr[i], indptr[i+1]
-        row_sum = 0.0
-
-        for j in range(start, end):
-            exp_val = np.exp(data[j] - row_max[i])
-            exp_data[j] = exp_val
-            row_sum += exp_val
-
-        row_sums[i] = row_sum
-
-    return exp_data, row_sums
-
-@njit
-def compute_posterior_and_freqs(exp_data, indices, indptr, row_sums, n_rows, n_taxa):
-    """JIT-optimized posterior probability and frequency computation."""
-    posterior_data = np.zeros_like(exp_data)
-    new_freq_vector = np.zeros(n_taxa)
-
-    for i in range(len(indptr) - 1):
-        start, end = indptr[i], indptr[i+1]
-        if start < end and row_sums[i] > 0:
-            for j in range(start, end):
-                posterior_data[j] = exp_data[j] / row_sums[i]
-                col = indices[j]
-                new_freq_vector[col] += posterior_data[j]
-
-    # Normalize new frequencies
-    total_reads = max(1, n_rows)
-    new_freq_vector /= total_reads
-
-    return posterior_data, new_freq_vector
-
-def expectation_maximization_vectorized(
-    log_p_rgs: Dict[str, Tuple[List[int], List[float]]],
-    freq: Dict[int, float],
-    max_iterations: int = 100,
-    epsilon: float = 1e-6
-) -> Tuple[Dict[int, float], float, Dict[int, Dict[str, float]]]:
-    """
-    Vectorized implementation of one iteration of the EM algorithm with JIT optimization.
-
-    Updates the relative abundance estimation in freq based on probabilities in log_p_rgs.
-
-    Args:
-        log_p_rgs: Dict mapping query_name to ([tax_ids], [log_scores])
-        freq: Dict mapping species_tax_id to likelihood
-        max_iterations: Maximum number of EM iterations within a single call
-        epsilon: Convergence threshold for relative change in frequencies
-
-    Returns:
-        Tuple containing:
-            - Updated frequency dict
-            - Total log likelihood
-            - Dict mapping species_tax_id to {read_id: probability}
-
-    Raises:
-        CalculationError: If there's an issue with the calculations
-    """
-    try:
-        # Set up data structures for sparse matrices
-        all_reads = list(log_p_rgs.keys())
-        all_taxa = list(freq.keys())
-        read_to_idx = {read: i for i, read in enumerate(all_reads)}
-        taxon_to_idx = {taxon: i for i, taxon in enumerate(all_taxa)}
-
-        # Create sparse matrices - prepare data
-        rows = []
-        cols = []
-        data = []
-
-        # Prepare data for sparse matrix construction
-        for read_idx, read in enumerate(all_reads):
-            valid_taxa = []
-            log_scores = []
-
-            # Filter only taxa with non-zero frequencies
-            for i, taxon in enumerate(log_p_rgs[read][0]):
-                if taxon in freq and freq[taxon] > 0:
-                    valid_taxa.append(taxon)
-                    log_scores.append(log_p_rgs[read][1][i])
-
-            if valid_taxa:
-                for i, taxon in enumerate(valid_taxa):
-                    rows.append(read_idx)
-                    cols.append(taxon_to_idx[taxon])
-                    data.append(log_scores[i])
-
-        # Create the sparse log probability matrix
-        n_reads = len(all_reads)
-        n_taxa = len(all_taxa)
-
-        # Use CSR format for better performance with our operations
-        log_prob_matrix = sparse.csr_matrix((data, (rows, cols)), shape=(n_reads, n_taxa))
-
-        # Convert frequency vector to numpy array
-        freq_vector = np.zeros(n_taxa)
-        for taxon, freq_val in freq.items():
-            freq_vector[taxon_to_idx[taxon]] = freq_val
-
-        # Ensure freq_vector sums to 1
-        freq_vector = freq_vector / np.sum(freq_vector)
-
-        # Prepare for iterations
-        log_freq_vector = np.log(np.maximum(freq_vector, 1e-15))  # Prevent log(0)
-        log_likelihood_prev = -np.inf
-
-        # Get CSR matrix components for JIT functions
-        log_prob_data = log_prob_matrix.data
-        log_prob_indices = log_prob_matrix.indices
-        log_prob_indptr = log_prob_matrix.indptr
-
-        # Perform EM iterations until convergence or max iterations
-        for iteration in range(max_iterations):
-            # E-step: Calculate log probabilities using JIT functions if available
-            if NUMBA_AVAILABLE:
-                # Add log frequencies to log probabilities
-                log_joint_data = compute_log_joint(
-                    log_prob_data, log_prob_indices, log_prob_indptr,
-                    log_freq_vector, n_reads
-                )
-
-                # Create a view of the log joint matrix with updated data
-                log_joint = sparse.csr_matrix(
-                    (log_joint_data, log_prob_indices, log_prob_indptr),
-                    shape=(n_reads, n_taxa)
-                )
-
-                # Calculate row maximums
-                row_max = compute_row_max(
-                    log_joint_data, log_prob_indices, log_prob_indptr, n_reads
-                )
-
-                # Calculate exp(log_joint - row_max) and row sums
-                exp_data, row_sums = compute_exp_and_sum(
-                    log_joint_data, log_prob_indices, log_prob_indptr,
-                    row_max, n_reads
-                )
-
-                # Calculate posteriors and new frequencies
-                posterior_data, new_freq_vector = compute_posterior_and_freqs(
-                    exp_data, log_prob_indices, log_prob_indptr,
-                    row_sums, n_reads, n_taxa
-                )
-
-                # Create posterior matrix from data
-                posterior = sparse.csr_matrix(
-                    (posterior_data, log_prob_indices, log_prob_indptr),
-                    shape=(n_reads, n_taxa)
-                )
-
-                # Calculate log-likelihood
-                log_likelihood = 0.0
-                for i in range(n_reads):
-                    if row_sums[i] > 0:
-                        log_likelihood += np.log(row_sums[i]) + row_max[i]
-
-            else:
-                # Original implementation for when Numba is not available
-                # E-step: Calculate log probabilities
-                # Add log frequencies to log probabilities
-                log_joint = log_prob_matrix.copy()
-                log_joint_data = log_joint.data
-
-                # Add log frequencies to each column (taxon)
-                for i in range(log_joint.indptr.size - 1):
-                    start, end = log_joint.indptr[i], log_joint.indptr[i+1]
-                    for j in range(start, end):
-                        col = log_joint.indices[j]
-                        log_joint_data[j] += log_freq_vector[col]
-
-                # Calculate log-sum-exp for each row (read)
-                row_max = np.zeros(n_reads)
-                for i in range(log_joint.indptr.size - 1):
-                    if log_joint.indptr[i] < log_joint.indptr[i+1]:  # If row has any entries
-                        start, end = log_joint.indptr[i], log_joint.indptr[i+1]
-                        row_max[i] = max(log_joint_data[j] for j in range(start, end))
-
-                # Calculate exp(log_joint - row_max) for each entry
-                exp_joint = log_joint.copy()
-                exp_joint_data = exp_joint.data
-                for i in range(exp_joint.indptr.size - 1):
-                    if exp_joint.indptr[i] < exp_joint.indptr[i+1]:  # If row has any entries
-                        start, end = exp_joint.indptr[i], exp_joint.indptr[i+1]
-                        for j in range(start, end):
-                            exp_joint_data[j] = np.exp(log_joint_data[j] - row_max[i])
-
-                # Calculate row sums (normalization)
-                row_sums = np.zeros(n_reads)
-                for i in range(exp_joint.indptr.size - 1):
-                    if exp_joint.indptr[i] < exp_joint.indptr[i+1]:  # If row has any entries
-                        start, end = exp_joint.indptr[i], exp_joint.indptr[i+1]
-                        row_sums[i] = sum(exp_joint_data[j] for j in range(start, end))
-
-                # Normalize to get posterior probabilities
-                posterior = exp_joint.copy()
-                posterior_data = posterior.data
-                for i in range(posterior.indptr.size - 1):
-                    if posterior.indptr[i] < posterior.indptr[i+1] and row_sums[i] > 0:  # If row has any entries
-                        start, end = posterior.indptr[i], posterior.indptr[i+1]
-                        for j in range(start, end):
-                            posterior_data[j] /= row_sums[i]
-
-                # Calculate log-likelihood
-                log_likelihood = 0.0
-                for i in range(n_reads):
-                    if row_sums[i] > 0:
-                        log_likelihood += np.log(row_sums[i]) + row_max[i]
-
-                # M-step: Update frequencies
-                new_freq_vector = np.zeros(n_taxa)
-                for i in range(posterior.indptr.size - 1):
-                    if posterior.indptr[i] < posterior.indptr[i+1]:  # If row has any entries
-                        start, end = posterior.indptr[i], posterior.indptr[i+1]
-                        for j in range(start, end):
-                            col = posterior.indices[j]
-                            new_freq_vector[col] += posterior_data[j]
-
-                # Normalize new frequencies
-                new_freq_vector /= max(1, n_reads)
-
-            # Check convergence
-            rel_change = np.max(np.abs(new_freq_vector - freq_vector) / (freq_vector + epsilon))
-            freq_vector = new_freq_vector
-            log_freq_vector = np.log(np.maximum(freq_vector, 1e-15))
-
-            # Print progress if verbose
-            logger.debug(f"EM Sub-iteration {iteration+1}: log-likelihood = {log_likelihood:.4f}, rel_change = {rel_change:.6f}")
-
-            # Check if converged
-            if rel_change < epsilon:
-                logger.debug(f"EM Sub-iterations converged after {iteration+1} iterations")
-                break
-
-            # Check if log-likelihood improved
-            if log_likelihood < log_likelihood_prev:
-                logger.warning("Log-likelihood decreased, stopping early")
-                break
-
-            log_likelihood_prev = log_likelihood
-
-        # Convert results back to dictionaries
-        frq = {all_taxa[i]: freq_vector[i] for i in range(n_taxa) if freq_vector[i] > 0}
-
-        # Create probability matrix for species-read assignments
-        p_sgr_flat = {}
-        for i in range(posterior.indptr.size - 1):
-            read = all_reads[i]
-            start, end = posterior.indptr[i], posterior.indptr[i+1]
-            for j in range(start, end):
-                col = posterior.indices[j]
-                taxon = all_taxa[col]
-                p_sgr_flat[(taxon, read)] = posterior.data[j]
-
-        # Convert flat dictionary to nested structure
-        p_sgr = unflatten(p_sgr_flat)
-
-        return frq, log_likelihood, p_sgr
-
-    except Exception as e:
-        raise CalculationError(f"Error in expectation maximization: {str(e)}")
-
-def batch_expectation_maximization(
-    log_p_rgs: Dict[str, Tuple[List[int], List[float]]],
-    freq: Dict[int, float],
-    batch_size: int = 1000
-) -> Tuple[Dict[int, float], float, Dict[int, Dict[str, float]]]:
-    """
-    EM algorithm that processes reads in batches for large datasets.
-
-    Args:
-        log_p_rgs: Dict mapping query_name to ([tax_ids], [log_scores])
-        freq: Dict mapping species_tax_id to likelihood
-        batch_size: Number of reads to process in each batch
-
-    Returns:
-        Tuple containing:
-            - Updated frequency dict
-            - Total log likelihood
-            - Dict mapping species_tax_id to {read_id: probability}
-    """
-    try:
-        all_reads = list(log_p_rgs.keys())
-        n_reads = len(all_reads)
-
-        # If dataset is small, use vectorized implementation directly
-        if n_reads <= batch_size:
-            return expectation_maximization_vectorized(log_p_rgs, freq)
-
-        # Split reads into batches
-        batch_count = (n_reads + batch_size - 1) // batch_size
-        read_batches = np.array_split(all_reads, batch_count)
-
-        logger.info(f"Processing {n_reads} reads in {batch_count} batches of ~{batch_size} reads each")
-
-        # Initialize accumulators
-        total_log_likelihood = 0.0
-        p_sgr_combined = {}
-        taxa_counts = defaultdict(float)
-
-        # Process each batch
-        for batch_idx, batch_reads in enumerate(read_batches):
-            logger.debug(f"Processing batch {batch_idx+1}/{batch_count} ({len(batch_reads)} reads)")
-
-            # Create batch subset of log_p_rgs
-            batch_log_p_rgs = {read: log_p_rgs[read] for read in batch_reads}
-
-            # Run EM on this batch
-            _, batch_log_likelihood, batch_p_sgr = expectation_maximization_vectorized(
-                batch_log_p_rgs, freq, max_iterations=3, epsilon=1e-4)
-
-            # Accumulate log likelihood
-            total_log_likelihood += batch_log_likelihood
-
-            # Accumulate taxon counts from posterior probabilities
-            for taxon, read_probs in batch_p_sgr.items():
-                taxa_counts[taxon] += sum(read_probs.values())
-
-                # Update combined probability matrix
-                if taxon not in p_sgr_combined:
-                    p_sgr_combined[taxon] = {}
-                p_sgr_combined[taxon].update(read_probs)
-
-        # Calculate final frequencies
-        total_taxa_count = sum(taxa_counts.values())
-        if total_taxa_count == 0:
-            raise CalculationError("No valid taxa counts after batch processing")
-
-        updated_freq = {taxon: count / n_reads for taxon, count in taxa_counts.items()}
-
-        # Ensure frequencies sum to 1
-        freq_sum = sum(updated_freq.values())
-        if not 0.99 <= freq_sum <= 1.01:
-            logger.warning(f"Normalizing frequency vector from {freq_sum} to 1.0")
-            updated_freq = {k: v / freq_sum for k, v in updated_freq.items()}
-
-        return updated_freq, total_log_likelihood, p_sgr_combined
-
-    except Exception as e:
-        raise CalculationError(f"Error in batch expectation maximization: {str(e)}")
-
 def expectation_maximization_iterations(
     log_p_rgs: Dict[str, Tuple[List[int], List[float]]],
     db_ids: List[int],
@@ -732,7 +301,9 @@ def expectation_maximization_iterations(
     input_threshold: float,
     max_iterations: int = 100,
     rel_tol: float = 1e-4,
-    batch_size: int = 1000
+    batch_size: int = 1000,
+    em_strategy: str = "auto",
+    parallel: bool = True
 ) -> Tuple[Dict[int, float], Optional[Dict[int, float]], Dict[int, Dict[str, float]]]:
     """
     Full expectation maximization algorithm with batching for large datasets.
@@ -745,6 +316,8 @@ def expectation_maximization_iterations(
         max_iterations: Maximum number of iterations
         rel_tol: Relative tolerance for early stopping
         batch_size: Number of reads to process in each batch
+        em_strategy: Strategy to use for EM algorithm ("auto", "vectorized", "batch", "memory_efficient")
+        parallel: Whether to use parallel processing when available
 
     Returns:
         Tuple containing:
@@ -753,6 +326,8 @@ def expectation_maximization_iterations(
             - Dict mapping species_tax_id to {read_id: probability}
     """
     try:
+        from emu.core.em_strategy import create_em_strategy
+
         n_db = len(db_ids)
         n_reads = len(log_p_rgs)
 
@@ -762,18 +337,36 @@ def expectation_maximization_iterations(
         if n_reads == 0:
             raise CalculationError("0 reads mapped")
 
-        # Determine whether to use batching based on dataset size
-        use_batching = n_reads > batch_size
-        em_function = batch_expectation_maximization if use_batching else expectation_maximization_vectorized
+        # Determine appropriate EM strategy if set to auto
+        if em_strategy == "auto":
+            if n_reads > 5000:
+                # Use batch processing for large datasets
+                strategy_type = "batch"
+                logger.info(f"Using batch EM strategy with batch size {batch_size}")
+            elif n_reads > 1000:
+                # Use memory-efficient processing for medium datasets
+                strategy_type = "memory_efficient"
+                logger.info("Using memory-efficient EM strategy")
+            else:
+                # Use vectorized processing for small datasets
+                strategy_type = "vectorized"
+                logger.info("Using vectorized EM strategy")
+        else:
+            strategy_type = em_strategy
+            logger.info(f"Using specified EM strategy: {strategy_type}")
 
-        if use_batching:
-            logger.info(f"Using batch processing with batch size {batch_size} for {n_reads} reads")
+        # Create EM strategy with appropriate parameters
+        strategy = create_em_strategy(
+            strategy_type=strategy_type,
+            batch_size=batch_size,
+            parallel=parallel
+        )
 
         # Initialize frequency vector
         freq = dict.fromkeys(db_ids, 1 / n_db)
 
-        # Keep track of frequency history for convergence detection
-        freq_history = []
+        # Keep track of frequency history (efficiently)
+        freq_changes = []
         counter = 1
 
         # Set output abundance threshold
@@ -786,18 +379,13 @@ def expectation_maximization_iterations(
 
         # Early stopping variables
         consecutive_small_improvements = 0
-        required_consecutive_small_improvements = 3  # Number of consecutive small improvements to trigger early stopping
+        required_consecutive_small_improvements = 3
 
         while counter <= max_iterations:
-            # Use the appropriate EM implementation based on dataset size
-            if use_batching:
-                freq, updated_log_likelihood, _ = batch_expectation_maximization(
-                    log_p_rgs, freq, batch_size=batch_size
-                )
-            else:
-                freq, updated_log_likelihood, _ = expectation_maximization_vectorized(
-                    log_p_rgs, freq, max_iterations=5, epsilon=1e-6
-                )
+            # Run EM iteration with appropriate strategy
+            freq, updated_log_likelihood, _ = strategy.run_em(
+                log_p_rgs, freq, max_iterations=5, epsilon=1e-6
+            )
 
             # Check f vector sums to 1
             freq_sum = sum(freq.values())
@@ -806,8 +394,17 @@ def expectation_maximization_iterations(
                 freq = {k: v/freq_sum for k, v in freq.items()}
                 logger.warning(f"Normalized frequency vector from {freq_sum} to 1.0")
 
-            # Track frequency history for convergence detection
-            freq_history.append(dict(freq))
+            # Track frequency changes efficiently
+            if len(freq_changes) > 0:
+                # Only store significant changes
+                changes = {}
+                for k, v in freq.items():
+                    prev_v = freq_changes[-1].get(k, 0)
+                    if abs(v - prev_v) > rel_tol * max(1e-10, prev_v):
+                        changes[k] = v
+                freq_changes.append(changes)
+            else:
+                freq_changes.append(dict(freq))
 
             # Confirm log likelihood increase
             log_likelihood_diff = updated_log_likelihood - total_log_likelihood
@@ -825,7 +422,10 @@ def expectation_maximization_iterations(
 
             if log_likelihood_diff < 0:
                 logger.warning("Log likelihood decreased, reverting to previous iteration")
-                freq = freq_history[-2]  # Revert to previous frequency
+                # Reconstruct full frequency dict from changes
+                freq = dict(freq_changes[-2])
+                for i in range(len(freq_changes) - 3, -1, -1):
+                    freq.update(freq_changes[i])
                 break
 
             # Check for early stopping based on small relative improvements
@@ -845,15 +445,24 @@ def expectation_maximization_iterations(
             # Check for convergence in frequency vectors
             if counter >= 3:
                 # Calculate maximum relative change in frequencies
-                prev_freq = freq_history[-2]
-                max_rel_change = max(
-                    abs(freq.get(k, 0) - prev_freq.get(k, 0)) / (prev_freq.get(k, 1e-10))
-                    for k in set(freq) | set(prev_freq)
-                )
+                prev_freq = {}
+                for i in range(len(freq_changes) - 2, -1, -1):
+                    prev_changes = freq_changes[i]
+                    for k, v in prev_changes.items():
+                        if k not in prev_freq:
+                            prev_freq[k] = v
 
-                if max_rel_change < rel_tol:
-                    logger.info(f"Early stopping triggered after {counter} iterations due to frequency convergence")
-                    break
+                # Calculate max relative change only for significant taxa
+                significant_taxa = set(freq) | set(prev_freq)
+                if significant_taxa:
+                    max_rel_change = max(
+                        abs(freq.get(k, 0) - prev_freq.get(k, 0)) / max(1e-10, prev_freq.get(k, 0))
+                        for k in significant_taxa
+                    )
+
+                    if max_rel_change < rel_tol:
+                        logger.info(f"Early stopping triggered after {counter} iterations due to frequency convergence")
+                        break
 
             counter += 1
 
@@ -863,58 +472,23 @@ def expectation_maximization_iterations(
         freq = {k: v for k, v in freq.items() if v >= freq_thresh}
 
         # Final EM iteration with filtered frequencies
-        if use_batching:
-            freq_full, updated_log_likelihood, p_sgr = batch_expectation_maximization(
-                log_p_rgs, freq, batch_size=batch_size
-            )
-        else:
-            freq_full, updated_log_likelihood, p_sgr = expectation_maximization_vectorized(
-                log_p_rgs, freq, max_iterations=10, epsilon=1e-8
-            )
+        freq_full, updated_log_likelihood, p_sgr = strategy.run_em(
+            log_p_rgs, freq, max_iterations=10, epsilon=1e-8
+        )
 
         # Apply threshold if needed
         freq_set_thresh = None
         if freq_thresh < input_threshold:
             freq_filtered = {k: v for k, v in freq_full.items() if v >= input_threshold}
             if freq_filtered:  # Only calculate if there are species above threshold
-                if use_batching:
-                    freq_set_thresh, _, _ = batch_expectation_maximization(
-                        log_p_rgs, freq_filtered, batch_size=batch_size
-                    )
-                else:
-                    freq_set_thresh, _, _ = expectation_maximization_vectorized(
-                        log_p_rgs, freq_filtered, max_iterations=10, epsilon=1e-8
-                    )
+                freq_set_thresh, _, _ = strategy.run_em(
+                    log_p_rgs, freq_filtered, max_iterations=10, epsilon=1e-8
+                )
 
         return freq_full, freq_set_thresh, p_sgr
 
     except Exception as e:
         raise CalculationError(f"Error in expectation maximization iterations: {str(e)}")
-
-def expectation_maximization(
-    log_p_rgs: Dict[str, Tuple[List[int], List[float]]],
-    freq: Dict[int, float]
-) -> Tuple[Dict[int, float], float, Dict[int, Dict[str, float]]]:
-    """
-    One iteration of the EM algorithm.
-
-    Updates the relative abundance estimation in freq based on probabilities in log_p_rgs.
-
-    Args:
-        log_p_rgs: Dict mapping query_name to ([tax_ids], [log_scores])
-        freq: Dict mapping species_tax_id to likelihood
-
-    Returns:
-        Tuple containing:
-            - Updated frequency dict
-            - Total log likelihood
-            - Dict mapping species_tax_id to {read_id: probability}
-
-    Raises:
-        CalculationError: If there's an issue with the calculations
-    """
-    # For backwards compatibility, we'll use the vectorized implementation
-    return expectation_maximization_vectorized(log_p_rgs, freq)
 
 def inspect_sam_file(sam_path):
     """Inspect the first few lines of a SAM file for debugging."""
@@ -977,17 +551,16 @@ def generate_alignments(
         sam_align_file = f"{out_basename}_emu_alignments.sam"
         db_sequence_file = database / 'species_taxid.fasta'
 
-        # Build minimap2 command
+        # Build minimap2 command with optimized parameters
+        base_cmd = (
+            f"minimap2 -ax {seq_type} -t {threads} -N {N} -p .9 -K {K} "
+        )
+
         if mm2_forward_only:
-            cmd = (
-                f"minimap2 -ax {seq_type} -t {threads} -N {N} -p .9 -u f -K {K} "
-                f"{db_sequence_file} {input_files_str} -o {sam_align_file}"
-            )
-        else:
-            cmd = (
-                f"minimap2 -ax {seq_type} -t {threads} -N {N} -p .9 -K {K} "
-                f"{db_sequence_file} {input_files_str} -o {sam_align_file}"
-            )
+            base_cmd += "-u f "
+
+        # Add input and output files
+        cmd = f"{base_cmd} {db_sequence_file} {input_files_str} -o {sam_align_file}"
 
         # Run minimap2
         logger.info(f"Running alignment with command: {cmd}")

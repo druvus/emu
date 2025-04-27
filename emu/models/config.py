@@ -53,6 +53,17 @@ class EmuConfig:
             self.keep_read_assignments = getattr(args, 'keep_read_assignments', False)
             self.output_unclassified = getattr(args, 'output_unclassified', False)
 
+            # New mapper options
+            self.mapper_type = getattr(args, 'mapper', 'auto')
+            self.mm2plus_path = getattr(args, 'mm2plus_path', None)
+
+            # Memory optimization options
+            self.em_strategy = getattr(args, 'em_strategy', 'auto')
+            self.memory_efficient = getattr(args, 'memory_efficient', False)
+
+            # Performance options
+            self.parallel_processing = getattr(args, 'parallel', True)
+
         # Build-database command configuration
         elif self.command == 'build-database':
             self.db_name = getattr(args, 'db_name', None)
